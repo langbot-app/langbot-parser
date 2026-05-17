@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import re
 import logging
@@ -9,7 +10,7 @@ from typing import Optional
 from docx import Document
 from docx.oxml.ns import qn
 
-from ..utils import run_sync
+from ..utils import count_words, run_sync
 from ..vision import ANALYZE_IMAGE_PROMPT, InvokeVision, sanitize_vision_text
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,6 @@ async def parse_docx(
         doc = Document(io.BytesIO(file_bytes))
         parts = []
         has_tables = False
-        word_count = 0
         images = []
         vision_tasks = []
         image_index = 0
@@ -61,8 +61,6 @@ async def parse_docx(
                     else:
                         para_parts.append(text)
 
-                    word_count += len(text)
-
                 for run in para.runs:
                     blips = run._element.findall(
                         './/{http://schemas.openxmlformats.org/drawingml/2006/main}blip'
@@ -81,7 +79,8 @@ async def parse_docx(
                             images.append({
                                 'index': image_index,
                                 'content_type': getattr(image_part, 'content_type', ''),
-                                'base64': img_b64,
+                                'sha256': hashlib.sha256(img_bytes).hexdigest(),
+                                'size_bytes': len(img_bytes),
                             })
                             if invoke_vision is not None:
                                 vision_tasks.append({
@@ -106,7 +105,7 @@ async def parse_docx(
 
         full_text = '\n'.join(parts)
         extra_metadata = {
-            'word_count': word_count,
+            'word_count': count_words(full_text),
             'has_tables': has_tables,
             'has_images': bool(images),
         }
@@ -118,10 +117,15 @@ async def parse_docx(
 
     if invoke_vision is not None and vision_tasks:
         described_count = 0
+        failed_count = 0
         for task in vision_tasks:
-            vision_text = sanitize_vision_text(
-                await invoke_vision(task['image_b64'], ANALYZE_IMAGE_PROMPT)
-            )
+            try:
+                raw_vision_text = await invoke_vision(task['image_b64'], ANALYZE_IMAGE_PROMPT)
+            except Exception as e:
+                logger.warning(f'DOCX image vision call failed: {e}')
+                failed_count += 1
+                continue
+            vision_text = sanitize_vision_text(raw_vision_text)
             if not vision_text:
                 continue
             full_text = full_text.replace(task['placeholder'], f'[图片描述: {vision_text}]', 1)
@@ -130,6 +134,8 @@ async def parse_docx(
         extra_metadata['vision_used'] = described_count > 0
         extra_metadata['vision_tasks_count'] = len(vision_tasks)
         extra_metadata['vision_images_described_count'] = described_count
+        extra_metadata['vision_failed_count'] = failed_count
+        extra_metadata['word_count'] = count_words(full_text)
     elif invoke_vision is not None:
         extra_metadata['vision_used'] = False
 

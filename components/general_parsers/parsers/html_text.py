@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 
 import markdown
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..utils import decode_text, run_sync
 from ..vision import ANALYZE_IMAGE_PROMPT, InvokeVision, sanitize_vision_text
@@ -32,30 +32,7 @@ async def parse_md(
         )
         soup = BeautifulSoup(html_content, 'html.parser')
         vision_tasks, image_count = _prepare_inline_images(soup, enable_vision=invoke_vision is not None)
-        text_parts = []
-        for element in soup.children:
-            if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                level = int(element.name[1])
-                text_parts.append('#' * level + ' ' + element.get_text().strip())
-            elif element.name == 'p':
-                text = element.get_text().strip()
-                if text:
-                    text_parts.append(text)
-            elif element.name in ['ul', 'ol']:
-                for li in element.find_all('li'):
-                    text_parts.append(f'* {li.get_text().strip()}')
-            elif element.name == 'pre':
-                code_block = element.get_text().strip()
-                if code_block:
-                    text_parts.append(f'```\n{code_block}\n```')
-            elif element.name == 'table':
-                table_str = _extract_table(element)
-                if table_str:
-                    text_parts.append(table_str)
-            elif element.name:
-                text = element.get_text(separator=' ', strip=True)
-                if text:
-                    text_parts.append(text)
+        text_parts = _extract_structured_text(soup)
         full_text = re.sub(r'\n\s*\n', '\n\n', '\n'.join(text_parts)).strip()
         metadata = {
             'has_images': image_count > 0,
@@ -83,29 +60,8 @@ async def parse_html(
         for s in soup(['script', 'style']):
             s.decompose()
         vision_tasks, image_count = _prepare_inline_images(soup, enable_vision=invoke_vision is not None)
-        text_parts = []
         container = soup.body if soup.body else soup
-        for element in container.children:
-            if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                level = int(element.name[1])
-                text_parts.append('#' * level + ' ' + element.get_text().strip())
-            elif element.name == 'p':
-                text = element.get_text().strip()
-                if text:
-                    text_parts.append(text)
-            elif element.name in ['ul', 'ol']:
-                for li in element.find_all('li'):
-                    text = li.get_text().strip()
-                    if text:
-                        text_parts.append(f'* {text}')
-            elif element.name == 'table':
-                table_str = _extract_table(element)
-                if table_str:
-                    text_parts.append(table_str)
-            elif element.name:
-                text = element.get_text(separator=' ', strip=True)
-                if text:
-                    text_parts.append(text)
+        text_parts = _extract_structured_text(container)
         full_text = re.sub(r'\n\s*\n', '\n\n', '\n'.join(text_parts)).strip()
         metadata = {
             'has_images': image_count > 0,
@@ -148,10 +104,15 @@ async def _apply_inline_image_vision(
         return full_text, {}
 
     described_count = 0
+    failed_count = 0
     for task in vision_tasks:
-        vision_text = sanitize_vision_text(
-            await invoke_vision(task['image_b64'], ANALYZE_IMAGE_PROMPT)
-        )
+        try:
+            raw_vision_text = await invoke_vision(task['image_b64'], ANALYZE_IMAGE_PROMPT)
+        except Exception as e:
+            logger.warning(f'Inline image vision call failed: {e}')
+            failed_count += 1
+            continue
+        vision_text = sanitize_vision_text(raw_vision_text)
         if not vision_text:
             continue
         full_text = full_text.replace(task['placeholder'], f'[图片描述: {vision_text}]', 1)
@@ -161,28 +122,100 @@ async def _apply_inline_image_vision(
         'vision_used': described_count > 0,
         'vision_tasks_count': len(vision_tasks),
         'vision_images_described_count': described_count,
+        'vision_failed_count': failed_count,
     }
+
+
+def _extract_structured_text(container) -> list[str]:
+    """Extract content in document order without flattening nested structure."""
+    text_parts: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, NavigableString):
+            text = str(node).strip()
+            if text:
+                text_parts.append(text)
+            return
+
+        if not isinstance(node, Tag):
+            return
+
+        name = (node.name or '').lower()
+        if name in {'script', 'style'}:
+            return
+
+        if name in {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+            text = node.get_text(separator=' ', strip=True)
+            if text:
+                level = int(name[1])
+                text_parts.append('#' * level + ' ' + text)
+            return
+
+        if name == 'p':
+            text = node.get_text(separator=' ', strip=True)
+            if text:
+                text_parts.append(text)
+            return
+
+        if name == 'li':
+            text = node.get_text(separator=' ', strip=True)
+            if text:
+                text_parts.append(f'* {text}')
+            return
+
+        if name == 'pre':
+            code_block = node.get_text().strip()
+            if code_block:
+                text_parts.append(f'```\n{code_block}\n```')
+            return
+
+        if name == 'table':
+            table_str = _extract_table(node)
+            if table_str:
+                text_parts.append(table_str)
+            return
+
+        for child in node.children:
+            walk(child)
+
+    for child in container.children:
+        walk(child)
+    return text_parts
 
 
 def _extract_table(table_element) -> str:
     """Convert a BeautifulSoup table element into a Markdown table string."""
-    headers = [th.get_text().strip() for th in table_element.find_all('th')]
+    headers = None
     rows = []
     for tr in table_element.find_all('tr'):
-        cells = [td.get_text().strip() for td in tr.find_all('td')]
+        th_cells = [th.get_text(separator=' ', strip=True) for th in tr.find_all('th')]
+        td_cells = [td.get_text(separator=' ', strip=True) for td in tr.find_all('td')]
+        if headers is None and th_cells:
+            headers = th_cells + td_cells
+            continue
+        cells = td_cells or th_cells
         if cells:
             rows.append(cells)
 
     if not headers and not rows:
         return ''
 
-    lines = []
-    if headers:
-        lines.append(' | '.join(headers))
-        lines.append(' | '.join(['---'] * len(headers)))
+    if not headers:
+        headers = rows[0]
+        rows = rows[1:]
+
+    col_count = max(len(headers), *(len(row) for row in rows)) if rows else len(headers)
+    headers = _pad_table_row(headers, col_count)
+    lines = [
+        '| ' + ' | '.join(headers) + ' |',
+        '| ' + ' | '.join(['---'] * col_count) + ' |',
+    ]
 
     for row_cells in rows:
-        padded = row_cells + [''] * (len(headers) - len(row_cells)) if headers else row_cells
-        lines.append(' | '.join(padded))
+        lines.append('| ' + ' | '.join(_pad_table_row(row_cells, col_count)) + ' |')
 
     return '\n'.join(lines)
+
+
+def _pad_table_row(row: list[str], col_count: int) -> list[str]:
+    return row + [''] * (col_count - len(row)) if len(row) < col_count else row[:col_count]

@@ -50,11 +50,12 @@ Official LangBot parser plugin that extracts structured text from files for Know
 
 ## Configuration
 
-The plugin exposes one optional config item:
+The plugin exposes two vision-related config items:
 
-- `vision_llm_model_uuid`: a vision-capable LLM used for scanned-page OCR, embedded PDF/DOCX image recognition, and direct image parsing
+- `enable_vision`: enables scanned-page OCR, embedded image recognition, and direct image parsing
+- `vision_llm_model_uuid`: a vision-capable LLM used when `enable_vision` is enabled
 
-If this option is left empty, GeneralParsers still works normally, but image understanding falls back to placeholders and PDF parsing uses text/layout extraction only.
+If vision is disabled or no model is selected, GeneralParsers still works normally, but image understanding falls back to placeholders and PDF parsing uses text/layout extraction only.
 
 ## Usage
 
@@ -82,6 +83,7 @@ Recent PDF parser metadata includes fields such as:
 - `vision_tasks_count`
 - `vision_scanned_pages_count`
 - `vision_images_described_count`
+- `vision_failed_count`
 
 ## Development
 

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import statistics
 from collections import Counter
 from typing import Optional
 
 import fitz
 
-from ..utils import run_sync
+from ..utils import count_words, run_sync
 from ..vision import (
     ANALYZE_IMAGE_PROMPT,
     OCR_PAGE_PROMPT,
@@ -57,7 +59,6 @@ async def parse_pdf(
         page_texts = []
         images = []
         scanned_pages = []
-        total_word_count = 0
         has_tables = False
 
         # Vision tasks collected during sync phase
@@ -241,7 +242,9 @@ async def parse_pdf(
                         'index': img_idx,
                         'width': pix.width,
                         'height': pix.height,
-                        'base64': img_b64,
+                        'format': 'png',
+                        'sha256': hashlib.sha256(img_bytes).hexdigest(),
+                        'size_bytes': len(img_bytes),
                     })
                     placeholder = f'[图片: 第{page_num}页-图片{img_idx + 1}]'
                     page_parts.append(placeholder)
@@ -259,7 +262,6 @@ async def parse_pdf(
 
             # --- B1: Improved scanned page detection ---
             plain_text = page.get_text('text').strip()
-            total_word_count += len(plain_text)
             text_len = len(plain_text)
             page_has_images = len(page_images) > 0
 
@@ -313,7 +315,7 @@ async def parse_pdf(
         full_text = '\n\n'.join(page_texts)
         extra_metadata = {
             'page_count': page_count,
-            'word_count': total_word_count,
+            'word_count': count_words(_strip_page_markers(full_text)),
             'has_tables': has_tables,
             'has_scanned_pages': bool(scanned_pages),
         }
@@ -330,17 +332,22 @@ async def parse_pdf(
     full_text, extra_metadata, vision_tasks = result
 
     # --- Async vision processing ---
+    vision_stats = {}
     if invoke_vision is not None and vision_tasks:
-        full_text = await _process_vision_tasks(full_text, vision_tasks, invoke_vision)
+        full_text, vision_stats = await _process_vision_tasks(full_text, vision_tasks, invoke_vision)
+        extra_metadata['word_count'] = count_words(_strip_page_markers(full_text))
 
     # B3: Vision call statistics
     if vision_tasks:
-        scanned_count = sum(1 for t in vision_tasks if t['type'] == 'scanned_page')
-        image_count = sum(1 for t in vision_tasks if t['type'] == 'embedded_image')
-        extra_metadata['vision_used'] = True
         extra_metadata['vision_tasks_count'] = len(vision_tasks)
-        extra_metadata['vision_scanned_pages_count'] = scanned_count
-        extra_metadata['vision_images_described_count'] = image_count
+        extra_metadata.setdefault('vision_scanned_pages_count', 0)
+        extra_metadata.setdefault('vision_images_described_count', 0)
+        extra_metadata.setdefault('vision_failed_count', 0)
+        extra_metadata.update(vision_stats)
+        extra_metadata['vision_used'] = (
+            extra_metadata['vision_scanned_pages_count']
+            + extra_metadata['vision_images_described_count']
+        ) > 0
     elif invoke_vision is not None:
         extra_metadata['vision_used'] = False
 
@@ -351,12 +358,17 @@ async def _process_vision_tasks(
     full_text: str,
     vision_tasks: list[dict],
     invoke_vision: InvokeVision,
-) -> str:
+) -> tuple[str, dict]:
     """Concurrently invoke the vision model for scanned pages and embedded images,
     then replace placeholders in the text with the results."""
     semaphore = asyncio.Semaphore(5)
+    stats = {
+        'vision_scanned_pages_count': 0,
+        'vision_images_described_count': 0,
+        'vision_failed_count': 0,
+    }
 
-    async def _call_vision(task: dict) -> tuple[dict, str]:
+    async def _call_vision(task: dict) -> tuple[dict, str, bool]:
         async with semaphore:
             try:
                 if task['type'] == 'scanned_page':
@@ -364,14 +376,17 @@ async def _process_vision_tasks(
                 else:
                     prompt = ANALYZE_IMAGE_PROMPT
                 result = await invoke_vision(task['image_b64'], prompt)
-                return task, result
+                return task, result, False
             except Exception as e:
                 logger.warning(f'Vision call failed for {task["type"]} page={task["page"]}: {e}')
-                return task, ''
+                return task, '', True
 
     results = await asyncio.gather(*[_call_vision(t) for t in vision_tasks])
 
-    for task, vision_text in results:
+    for task, vision_text, failed in results:
+        if failed:
+            stats['vision_failed_count'] += 1
+            continue
         vision_text = sanitize_vision_text(vision_text)
         if not vision_text:
             continue
@@ -412,15 +427,20 @@ async def _process_vision_tasks(
                 else:
                     content_end = next_page_pos
 
-                old_content = full_text[content_start:content_end]
                 full_text = full_text[:content_start] + vision_text + full_text[content_end:]
+            stats['vision_scanned_pages_count'] += 1
 
         elif task['type'] == 'embedded_image':
             placeholder = task['placeholder']
             replacement = f'[图片描述: {vision_text}]'
             full_text = full_text.replace(placeholder, replacement, 1)
+            stats['vision_images_described_count'] += 1
 
-    return full_text
+    return full_text, stats
+
+
+def _strip_page_markers(text: str) -> str:
+    return re.sub(r'<!-- PAGE:\d+ -->\n?', '', text)
 
 
 def _pymupdf_table_to_markdown(table) -> str:

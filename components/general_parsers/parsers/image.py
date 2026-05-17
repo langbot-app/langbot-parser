@@ -26,10 +26,19 @@ async def parse_image(
         return f'[图片文件: {filename}]', extra_metadata
 
     image_b64 = encode_image_base64(file_bytes)
-    vision_text = sanitize_vision_text(await invoke_vision(image_b64, ANALYZE_IMAGE_PROMPT))
-    extra_metadata['vision_used'] = bool(vision_text)
     extra_metadata['vision_tasks_count'] = 1
+    try:
+        raw_vision_text = await invoke_vision(image_b64, ANALYZE_IMAGE_PROMPT)
+    except Exception as e:
+        logger.warning(f'Image vision call failed for {filename}: {e}')
+        extra_metadata['vision_images_described_count'] = 0
+        extra_metadata['vision_failed_count'] = 1
+        return f'[图片文件: {filename}]', extra_metadata
+
+    vision_text = sanitize_vision_text(raw_vision_text)
+    extra_metadata['vision_used'] = bool(vision_text)
     extra_metadata['vision_images_described_count'] = 1 if vision_text else 0
+    extra_metadata['vision_failed_count'] = 0
 
     if not vision_text:
         return f'[图片文件: {filename}]', extra_metadata

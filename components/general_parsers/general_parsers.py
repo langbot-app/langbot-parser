@@ -7,7 +7,7 @@ from .parsers.pdf import parse_pdf
 from .parsers.docx import parse_docx
 from .parsers.image import parse_image
 from .parsers.html_text import parse_txt, parse_md, parse_html
-from .utils import decode_text, find_page
+from .utils import config_bool, decode_text, find_page
 
 from langbot_plugin.api.definition.components.parser.parser import Parser
 from langbot_plugin.api.entities.builtin.rag.models import (
@@ -98,8 +98,9 @@ class GeneralParsers(Parser):
 
         # Build invoke_vision callback if a vision model is configured
         invoke_vision = None
-        config = self.plugin.get_config()
-        vision_model_uuid = config.get('vision_llm_model_uuid')
+        config = self.plugin.get_config() or {}
+        vision_enabled = config_bool(config.get('enable_vision'))
+        vision_model_uuid = config.get('vision_llm_model_uuid') if vision_enabled else None
         if vision_model_uuid:
             async def invoke_vision(image_b64: str, prompt: str) -> str:
                 from langbot_plugin.api.entities.builtin.provider.message import (
