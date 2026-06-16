@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import re
 import logging
-
-from .parsers.pdf import parse_pdf
-from .parsers.docx import parse_docx
-from .parsers.image import parse_image
-from .parsers.html_text import parse_txt, parse_md, parse_html
+from importlib import import_module
 from .utils import config_bool, decode_text, find_page
 
 from langbot_plugin.api.definition.components.parser.parser import Parser
@@ -20,21 +16,21 @@ from langbot_plugin.api.entities.builtin.rag.models import (
 logger = logging.getLogger(__name__)
 
 PARSERS = {
-    'pdf': parse_pdf,
-    'docx': parse_docx,
+    'pdf': '.parsers.pdf:parse_pdf',
+    'docx': '.parsers.docx:parse_docx',
     'doc': None,  # not supported
-    'txt': parse_txt,
-    'md': parse_md,
-    'html': parse_html,
-    'htm': parse_html,
-    'png': parse_image,
-    'jpg': parse_image,
-    'jpeg': parse_image,
-    'webp': parse_image,
-    'gif': parse_image,
-    'bmp': parse_image,
-    'tif': parse_image,
-    'tiff': parse_image,
+    'txt': '.parsers.html_text:parse_txt',
+    'md': '.parsers.html_text:parse_md',
+    'html': '.parsers.html_text:parse_html',
+    'htm': '.parsers.html_text:parse_html',
+    'png': '.parsers.image:parse_image',
+    'jpg': '.parsers.image:parse_image',
+    'jpeg': '.parsers.image:parse_image',
+    'webp': '.parsers.image:parse_image',
+    'gif': '.parsers.image:parse_image',
+    'bmp': '.parsers.image:parse_image',
+    'tif': '.parsers.image:parse_image',
+    'tiff': '.parsers.image:parse_image',
 }
 
 VISION_AWARE_EXTENSIONS = {
@@ -68,6 +64,38 @@ MIME_EXTENSION_FALLBACK = {
 }
 
 
+def _filename_extension(filename: str) -> str:
+    if '.' not in filename:
+        return ''
+    return filename.rsplit('.', 1)[-1].lower()
+
+
+def _select_extension(filename: str, mime_type: str) -> tuple[str, str, str | None]:
+    filename_extension = _filename_extension(filename)
+    mime_extension = MIME_EXTENSION_FALLBACK.get(mime_type, '')
+    if mime_extension:
+        warning = None
+        if (
+            filename_extension
+            and filename_extension in PARSERS
+            and filename_extension != mime_extension
+        ):
+            warning = (
+                f"filename extension '{filename_extension}' conflicts with "
+                f"MIME type '{mime_type}', using MIME-derived '{mime_extension}'"
+            )
+        return mime_extension, 'mime_type', warning
+    if filename_extension:
+        return filename_extension, 'filename', None
+    return '', 'unknown', None
+
+
+def _load_parser(parser_ref: str):
+    module_name, attr_name = parser_ref.split(':', 1)
+    module = import_module(module_name, package=__package__)
+    return getattr(module, attr_name)
+
+
 class GeneralParsers(Parser):
     """GeneralParsers component that extracts structured text from binary files.
 
@@ -87,14 +115,10 @@ class GeneralParsers(Parser):
         filename = context.filename
         file_bytes = context.file_content
         mime_type = (context.mime_type or '').split(';', 1)[0].strip().lower()
-
-        # Determine extension from filename
-        if '.' in filename:
-            extension = filename.rsplit('.', 1)[-1].lower()
-        else:
-            extension = ''
-        if not extension:
-            extension = MIME_EXTENSION_FALLBACK.get(mime_type, '')
+        extension, extension_source, extension_warning = _select_extension(
+            filename,
+            mime_type,
+        )
 
         # Build invoke_vision callback if a vision model is configured
         invoke_vision = None
@@ -122,12 +146,13 @@ class GeneralParsers(Parser):
 
         extra_metadata = {}
         if extension in PARSERS:
-            parser_func = PARSERS[extension]
-            if parser_func is None:
+            parser_ref = PARSERS[extension]
+            if parser_ref is None:
                 logger.warning(f'Unsupported file format: {extension} for {filename}')
                 text = ''
             else:
                 try:
+                    parser_func = _load_parser(parser_ref)
                     if extension in VISION_AWARE_EXTENSIONS:
                         result = await parser_func(file_bytes, filename, invoke_vision=invoke_vision)
                     else:
@@ -139,6 +164,10 @@ class GeneralParsers(Parser):
                         text = result
                 except Exception as e:
                     logger.error(f'Failed to parse {extension} file {filename}: {e}')
+                    extra_metadata = {
+                        'parser_failed': True,
+                        'parse_error': str(e),
+                    }
                     text = None
         else:
             logger.warning(f'Unsupported file format: {extension} for {filename}, trying as text')
@@ -157,7 +186,10 @@ class GeneralParsers(Parser):
             'filename': filename,
             'mime_type': context.mime_type,
             'extension': extension,
+            'extension_source': extension_source,
         }
+        if extension_warning:
+            metadata['extension_warning'] = extension_warning
         metadata.update(extra_metadata)
 
         return ParseResult(
@@ -282,7 +314,8 @@ class GeneralParsers(Parser):
         for i, (start, end, level, heading) in enumerate(deduped):
             content_start = end
             content_end = deduped[i + 1][0] if i + 1 < len(deduped) else len(text)
-            content = text[content_start:content_end].strip()
+            body = text[content_start:content_end].strip()
+            content = f'{heading}\n{body}' if body else heading
             if content:
                 page = find_page(start, page_positions) if page_positions else None
                 sections.append(

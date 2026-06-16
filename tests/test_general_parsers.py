@@ -78,18 +78,14 @@ _install_optional_dependency_stubs()
 
 
 class GeneralParsersConfigTests(unittest.IsolatedAsyncioTestCase):
-    async def test_enable_vision_false_suppresses_configured_model(self) -> None:
+    def _parser_with_config(self, config: dict | None = None):
         from components.general_parsers.general_parsers import GeneralParsers
-        from langbot_plugin.api.entities.builtin.rag.models import ParseContext
 
         class Plugin:
             called = False
 
             def get_config(self) -> dict:
-                return {
-                    'enable_vision': False,
-                    'vision_llm_model_uuid': 'vision-model',
-                }
+                return config or {}
 
             async def invoke_llm(self, *args, **kwargs):
                 self.called = True
@@ -98,6 +94,15 @@ class GeneralParsersConfigTests(unittest.IsolatedAsyncioTestCase):
         plugin = Plugin()
         parser = GeneralParsers()
         parser.plugin = plugin
+        return parser, plugin
+
+    async def test_enable_vision_false_suppresses_configured_model(self) -> None:
+        from langbot_plugin.api.entities.builtin.rag.models import ParseContext
+
+        parser, plugin = self._parser_with_config({
+            'enable_vision': False,
+            'vision_llm_model_uuid': 'vision-model',
+        })
 
         result = await parser.parse(
             ParseContext(
@@ -110,6 +115,59 @@ class GeneralParsersConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin.called)
         self.assertEqual(result.text, '[图片文件: diagram.png]')
         self.assertFalse(result.metadata['vision_used'])
+
+    async def test_mime_type_overrides_conflicting_filename_extension(self) -> None:
+        from langbot_plugin.api.entities.builtin.rag.models import ParseContext
+
+        parser, _ = self._parser_with_config()
+
+        result = await parser.parse(
+            ParseContext(
+                file_content=b'<html><body><h1>HTML Title</h1><p>Body</p></body></html>',
+                filename='wrong.txt',
+                mime_type='text/html',
+            )
+        )
+
+        self.assertEqual(result.metadata['extension'], 'html')
+        self.assertEqual(result.metadata['extension_source'], 'mime_type')
+        self.assertIn('extension_warning', result.metadata)
+        self.assertIn('# HTML Title', result.text)
+
+    async def test_parse_failure_is_reported_in_metadata(self) -> None:
+        from langbot_plugin.api.entities.builtin.rag.models import ParseContext
+
+        parser, _ = self._parser_with_config()
+
+        result = await parser.parse(
+            ParseContext(
+                file_content=b'not a real pdf',
+                filename='broken.pdf',
+                mime_type='application/pdf',
+            )
+        )
+
+        self.assertEqual(result.text, '')
+        self.assertTrue(result.metadata['parser_failed'])
+        self.assertIn('parse_error', result.metadata)
+
+    async def test_section_content_includes_heading_for_langrag_indexing(self) -> None:
+        from langbot_plugin.api.entities.builtin.rag.models import ParseContext
+
+        parser, _ = self._parser_with_config()
+
+        result = await parser.parse(
+            ParseContext(
+                file_content=b'<html><body><h2>Structured Output</h2><p>Body text</p></body></html>',
+                filename='doc.html',
+                mime_type='text/html',
+            )
+        )
+
+        self.assertEqual(result.sections[0].heading, 'Structured Output')
+        self.assertEqual(result.sections[0].level, 2)
+        self.assertTrue(result.sections[0].content.startswith('Structured Output\n'))
+        self.assertIn('Body text', result.sections[0].content)
 
 
 class HtmlParserTests(unittest.IsolatedAsyncioTestCase):
@@ -136,6 +194,15 @@ class HtmlParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(text.index('# Title'), text.index('Intro paragraph'))
         self.assertLess(text.index('Intro paragraph'), text.index('| A |'))
         self.assertFalse(metadata['has_images'])
+
+    async def test_html_uses_detected_encoding(self) -> None:
+        from components.general_parsers.parsers.html_text import parse_html
+
+        html = '<html><body><p>中文内容</p></body></html>'.encode('gbk')
+
+        text, _ = await parse_html(html, 'gbk.html')
+
+        self.assertIn('中文内容', text)
 
     async def test_inline_image_vision_failure_keeps_text_and_placeholder(self) -> None:
         from components.general_parsers.parsers.html_text import parse_html

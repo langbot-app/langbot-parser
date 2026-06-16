@@ -15,10 +15,26 @@ _CJK_CHAR_RE = re.compile(
 
 
 def decode_text(file_bytes: bytes) -> str:
-    """Decode bytes to text with encoding detection."""
+    """Decode bytes to text with conservative encoding detection."""
+    for encoding in ('utf-8', 'utf-8-sig'):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
     detected = chardet.detect(file_bytes)
-    encoding = detected['encoding'] or 'utf-8'
-    return file_bytes.decode(encoding, errors='ignore')
+    encoding = detected.get('encoding')
+    confidence = detected.get('confidence') or 0
+    if encoding and confidence >= 0.6:
+        return file_bytes.decode(encoding, errors='ignore')
+
+    for encoding in ('gb18030', 'gbk', 'big5'):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
+    return file_bytes.decode(encoding or 'utf-8', errors='ignore')
 
 
 def count_words(text: str) -> int:

@@ -26,7 +26,7 @@ async def parse_md(
     logger.info(f'Parsing Markdown file: {filename}')
 
     def _sync():
-        md_content = file_bytes.decode('utf-8', errors='ignore')
+        md_content = decode_text(file_bytes)
         html_content = markdown.markdown(
             md_content, extensions=['extra', 'codehilite', 'tables', 'toc', 'fenced_code']
         )
@@ -55,7 +55,7 @@ async def parse_html(
     logger.info(f'Parsing HTML file: {filename}')
 
     def _sync():
-        html_content = file_bytes.decode('utf-8', errors='ignore')
+        html_content = decode_text(file_bytes)
         soup = BeautifulSoup(html_content, 'html.parser')
         for s in soup(['script', 'style']):
             s.decompose()
