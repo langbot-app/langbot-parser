@@ -55,6 +55,9 @@ spec:
     Parser:
       fromDirs:
       - path: components/general_parsers/
+    Page:
+      fromDirs:
+      - path: components/pages/
 execution:
   python:
     path: main.py

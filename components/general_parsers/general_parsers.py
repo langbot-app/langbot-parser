@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 import logging
+import time
 from importlib import import_module
+from typing import Any
 from .utils import config_bool, decode_text, find_page
+from ..observability import get_telemetry
 
 from langbot_plugin.api.definition.components.parser.parser import Parser
 from langbot_plugin.api.entities.builtin.rag.models import (
@@ -112,91 +115,132 @@ class GeneralParsers(Parser):
         Returns:
             ParseResult with extracted text and optional structured sections.
         """
+        started_at = time.perf_counter()
         filename = context.filename
-        file_bytes = context.file_content
-        mime_type = (context.mime_type or '').split(';', 1)[0].strip().lower()
-        extension, extension_source, extension_warning = _select_extension(
-            filename,
-            mime_type,
-        )
+        raw_mime_type = context.mime_type
+        mime_type = (raw_mime_type or '').split(';', 1)[0].strip().lower()
+        extension = ''
+        extension_source = 'unknown'
+        text_for_telemetry = ''
+        sections_for_telemetry: list[Any] = []
+        metadata_for_telemetry: dict[str, Any] = {}
+        raised_error: Exception | None = None
 
-        # Build invoke_vision callback if a vision model is configured
-        invoke_vision = None
-        config = self.plugin.get_config() or {}
-        vision_enabled = config_bool(config.get('enable_vision'))
-        vision_model_uuid = config.get('vision_llm_model_uuid') if vision_enabled else None
-        if vision_model_uuid:
-            async def invoke_vision(image_b64: str, prompt: str) -> str:
-                from langbot_plugin.api.entities.builtin.provider.message import (
-                    Message, ContentElement,
-                )
-                resp = await self.plugin.invoke_llm(
-                    vision_model_uuid,
-                    [Message(role='user', content=[
-                        ContentElement.from_image_base64(image_b64),
-                        ContentElement.from_text(prompt),
-                    ])],
-                    timeout=60,
-                )
-                if isinstance(resp.content, str):
-                    return resp.content
-                return ''.join(
-                    e.text for e in resp.content if e.type == 'text' and e.text
-                )
+        try:
+            file_bytes = context.file_content
+            extension, extension_source, extension_warning = _select_extension(
+                filename,
+                mime_type,
+            )
 
-        extra_metadata = {}
-        if extension in PARSERS:
-            parser_ref = PARSERS[extension]
-            if parser_ref is None:
-                logger.warning(f'Unsupported file format: {extension} for {filename}')
-                text = ''
+            # Build invoke_vision callback if a vision model is configured
+            invoke_vision = None
+            config = self.plugin.get_config() or {}
+            vision_enabled = config_bool(config.get('enable_vision'))
+            vision_model_uuid = config.get('vision_llm_model_uuid') if vision_enabled else None
+            if vision_model_uuid:
+                async def invoke_vision(image_b64: str, prompt: str) -> str:
+                    from langbot_plugin.api.entities.builtin.provider.message import (
+                        Message, ContentElement,
+                    )
+                    resp = await self.plugin.invoke_llm(
+                        vision_model_uuid,
+                        [Message(role='user', content=[
+                            ContentElement.from_image_base64(image_b64),
+                            ContentElement.from_text(prompt),
+                        ])],
+                        timeout=60,
+                    )
+                    if isinstance(resp.content, str):
+                        return resp.content
+                    return ''.join(
+                        e.text for e in resp.content if e.type == 'text' and e.text
+                    )
+
+            extra_metadata = {}
+            if extension in PARSERS:
+                parser_ref = PARSERS[extension]
+                if parser_ref is None:
+                    logger.warning(f'Unsupported file format: {extension} for {filename}')
+                    text = ''
+                else:
+                    try:
+                        parser_func = _load_parser(parser_ref)
+                        if extension in VISION_AWARE_EXTENSIONS:
+                            result = await parser_func(file_bytes, filename, invoke_vision=invoke_vision)
+                        else:
+                            result = await parser_func(file_bytes, filename)
+                        # Parsers may return (text, extra_metadata) or plain text only.
+                        if isinstance(result, tuple):
+                            text, extra_metadata = result
+                        else:
+                            text = result
+                    except Exception as e:
+                        logger.error(f'Failed to parse {extension} file {filename}: {e}')
+                        extra_metadata = {
+                            'parser_failed': True,
+                            'parse_error': str(e),
+                        }
+                        text = None
             else:
-                try:
-                    parser_func = _load_parser(parser_ref)
-                    if extension in VISION_AWARE_EXTENSIONS:
-                        result = await parser_func(file_bytes, filename, invoke_vision=invoke_vision)
-                    else:
-                        result = await parser_func(file_bytes, filename)
-                    # Parsers may return (text, extra_metadata) or plain text only.
-                    if isinstance(result, tuple):
-                        text, extra_metadata = result
-                    else:
-                        text = result
-                except Exception as e:
-                    logger.error(f'Failed to parse {extension} file {filename}: {e}')
-                    extra_metadata = {
-                        'parser_failed': True,
-                        'parse_error': str(e),
-                    }
-                    text = None
-        else:
-            logger.warning(f'Unsupported file format: {extension} for {filename}, trying as text')
-            text = decode_text(file_bytes)
+                logger.warning(f'Unsupported file format: {extension} for {filename}, trying as text')
+                text = decode_text(file_bytes)
 
-        if text is None:
-            text = ''
+            if text is None:
+                text = ''
 
-        sections = self._split_sections(text, filename, track_pages=(extension == 'pdf'))
+            sections = self._split_sections(text, filename, track_pages=(extension == 'pdf'))
 
-        # Strip page markers from the text output
-        if extension == 'pdf':
-            text = re.sub(r'<!-- PAGE:\d+ -->\n?', '', text)
+            # Strip page markers from the text output
+            if extension == 'pdf':
+                text = re.sub(r'<!-- PAGE:\d+ -->\n?', '', text)
 
-        metadata = {
-            'filename': filename,
-            'mime_type': context.mime_type,
-            'extension': extension,
-            'extension_source': extension_source,
-        }
-        if extension_warning:
-            metadata['extension_warning'] = extension_warning
-        metadata.update(extra_metadata)
+            metadata = {
+                'filename': filename,
+                'mime_type': context.mime_type,
+                'extension': extension,
+                'extension_source': extension_source,
+            }
+            if extension_warning:
+                metadata['extension_warning'] = extension_warning
+            metadata.update(extra_metadata)
 
-        return ParseResult(
-            text=text,
-            sections=sections,
-            metadata=metadata,
-        )
+            text_for_telemetry = text
+            sections_for_telemetry = sections
+            metadata_for_telemetry = metadata
+
+            return ParseResult(
+                text=text,
+                sections=sections,
+                metadata=metadata,
+            )
+        except Exception as e:
+            raised_error = e
+            metadata_for_telemetry = {
+                'filename': filename,
+                'mime_type': raw_mime_type,
+                'extension': extension,
+                'extension_source': extension_source,
+                'parser_failed': True,
+                'parse_error': str(e),
+            }
+            raise
+        finally:
+            try:
+                get_telemetry().record_parse(
+                    filename=filename,
+                    mime_type=raw_mime_type,
+                    extension=extension,
+                    extension_source=extension_source,
+                    duration_ms=(time.perf_counter() - started_at) * 1000,
+                    text_chars=len(text_for_telemetry or ''),
+                    sections_count=len(sections_for_telemetry or []),
+                    metadata=metadata_for_telemetry,
+                    failed=raised_error is not None,
+                    parse_error=str(raised_error) if raised_error is not None else None,
+                )
+            except Exception as telemetry_error:
+                logger.warning(f'Failed to record parser telemetry: {telemetry_error}')
 
     # ========== Section Extraction ==========
 

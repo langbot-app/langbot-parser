@@ -85,6 +85,24 @@ Recent PDF parser metadata includes fields such as:
 - `vision_images_described_count`
 - `vision_failed_count`
 
+## Observability Page
+
+GeneralParsers includes a lightweight WebUI Page named **Parser Observability**.
+It shows in-memory parser telemetry for recent parse activity:
+
+- total parses, failures, average/max duration, extracted text characters, sections, and vision tasks
+- extension distribution so parser format coverage is easy to inspect
+- vision counters for OCR/image-description usage and failures
+- recent parse events with file name, MIME type, duration, output size, media flags, and status
+- recent parser errors for quick debugging
+
+The page intentionally records only operational metadata. It does not store file
+bytes or extracted text.
+
+The Page backend exposes `/snapshot` and `/clear` through the LangBot Page API.
+The UI includes `en_US` and `zh_Hans` i18n assets under
+`components/pages/i18n/`.
+
 ## Development
 
 ```bash
@@ -93,6 +111,13 @@ cp .env.example .env
 ```
 
 Configure `DEBUG_RUNTIME_WS_URL` and `PLUGIN_DEBUG_KEY` in `.env`, then launch with your IDE debugger.
+
+### Testing
+
+```bash
+python3 -m compileall -q main.py components tests
+python3 -m unittest discover -s tests
+```
 
 ## Contributing
 
