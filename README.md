@@ -1,3 +1,5 @@
+> **Moved:** This plugin is now maintained in [langbot-plugins/misc/GeneralParsers](https://github.com/langbot-app/langbot-plugins/tree/main/misc/GeneralParsers). This repository is archived.
+
 # GeneralParsers
 
 Official LangBot parser plugin that extracts structured text from files for KnowledgeEngine plugins (e.g. LangRAG).
